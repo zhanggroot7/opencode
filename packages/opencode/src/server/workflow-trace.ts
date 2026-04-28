@@ -33,27 +33,18 @@ function maxAssistantOutputChars() {
 function maxModelStreamChars() {
   return envInt("OPENCODE_TRACE_MAX_STREAM_CHARS", 500_000)
 }
-/** Cap total streamed trace rows (each SDK text/reasoning delta is one row; raise if traces truncate). */
-const MAX_STREAM_EVENTS = () => envInt("OPENCODE_TRACE_MAX_LLM_EVENTS", 50_000)
-/** Per-event cap for stream `snippet` (single delta / tool rows). */
-const SNIPPET_CAP = 8192
+/** Cap `chat.part_deltas` rows (same granularity as bus `message.part.delta`). */
+const MAX_PART_DELTA_EVENTS = () => envInt("OPENCODE_TRACE_MAX_PART_DELTAS", 100_000)
+/** Per-row cap for `part_deltas[].delta`. */
+const PART_DELTA_CAP = () => envInt("OPENCODE_TRACE_PART_DELTA_CAP", 8192)
 
-/** LLM stream-shaped entries for the trace JSON (one row per SDK chunk; no delta merging). */
-export type WorkflowChatStreamEntry = {
+/** One bus-aligned `message.part.delta` payload (UI stream chunks). */
+export type WorkflowChatPartDeltaEntry = {
   ms: number
-  kind: string
-  snippet?: string
-  meta?: string
-}
-
-/** Logical channel for one contiguous segment of SDK events (splits when channel changes). */
-export type WorkflowChatStreamPackageKind = "control" | "reasoning" | "text" | "tool"
-
-export type WorkflowChatStreamPackage = {
-  kind: WorkflowChatStreamPackageKind
-  from_ms: number
-  to_ms: number
-  events: WorkflowChatStreamEntry[]
+  message_id: string
+  part_id: string
+  field: string
+  delta: string
 }
 
 export type WorkflowChatTrace = {
@@ -72,15 +63,10 @@ export type WorkflowChatTrace = {
   /** Concatenated assistant `text-delta` chunks in order (stream replay, capped). */
   model_stream_text?: string
   /**
-   * Stream events grouped by channel (`control` / `reasoning` / `text` / `tool`).
-   * Order within each package matches SDK arrival order; a new package opens when the channel changes.
+   * Each entry matches one `session.updatePartDelta` / bus `message.part.delta` (text + reasoning).
+   * Order and chunking match what the UI receives.
    */
-  stream_packages?: WorkflowChatStreamPackage[]
-  /**
-   * Flattened stream replay: `stream_packages` concatenated in order (set at persist).
-   * Prefer `stream_packages` for structured consumers.
-   */
-  llm_stream?: WorkflowChatStreamEntry[]
+  part_deltas?: WorkflowChatPartDeltaEntry[]
   /**
    * Time to first **user-visible** assistant text (`text-delta`), in ms from HTTP trace start (`t0`).
    * Same notion as TTFT for chat UIs. Omitted if no text was streamed.
@@ -218,35 +204,6 @@ function ensureChat(s: WorkflowTraceSession) {
   if (!s.chat) s.chat = {}
 }
 
-function channelForStreamKind(kind: string): WorkflowChatStreamPackageKind {
-  if (kind.startsWith("reasoning")) return "reasoning"
-  if (kind.startsWith("text")) return "text"
-  if (kind.startsWith("tool")) return "tool"
-  return "control"
-}
-
-function streamEventCount(chat: WorkflowChatTrace): number {
-  const pkgs = chat.stream_packages
-  if (pkgs?.length) {
-    let n = 0
-    for (const p of pkgs) n += p.events.length
-    return n
-  }
-  return chat.llm_stream?.length ?? 0
-}
-
-function finalizeLlmStreamFromPackages(s: WorkflowTraceSession) {
-  const pkgs = s.chat?.stream_packages
-  if (!pkgs?.length) return
-  ensureChat(s)
-  s.chat!.llm_stream = pkgs.flatMap((p) => p.events)
-}
-
-function capSnippet(s: string) {
-  if (s.length <= SNIPPET_CAP) return s
-  return `${s.slice(0, SNIPPET_CAP - 3)}...`
-}
-
 /** Accumulate assistant text-delta without repeated string reallocation (critical for streaming perf). */
 function appendModelStreamText(s: WorkflowTraceSession, delta: string) {
   if (!delta) return
@@ -265,26 +222,6 @@ function materializeModelStreamText(s: WorkflowTraceSession) {
   if (!s._modelStreamChunks?.length) return
   ensureChat(s)
   s.chat!.model_stream_text = s._modelStreamChunks.join("")
-}
-
-function pushLlmTrace(s: WorkflowTraceSession, kind: string, snippet?: string, meta?: string) {
-  ensureChat(s)
-  if (streamEventCount(s.chat!) >= MAX_STREAM_EVENTS()) return
-  const ms = Math.round(performance.now() - s.t0Ms)
-  const row: WorkflowChatStreamEntry = { ms, kind }
-  if (snippet !== undefined && snippet.length > 0) row.snippet = capSnippet(snippet)
-  if (meta !== undefined && meta.length > 0) row.meta = meta.length > 2000 ? `${meta.slice(0, 1997)}...` : meta
-
-  const channel = channelForStreamKind(kind)
-  if (!s.chat!.stream_packages) s.chat!.stream_packages = []
-  const pkgs = s.chat!.stream_packages
-  let last = pkgs[pkgs.length - 1]
-  if (!last || last.kind !== channel) {
-    last = { kind: channel, from_ms: ms, to_ms: ms, events: [] }
-    pkgs.push(last)
-  }
-  last.events.push(row)
-  last.to_ms = ms
 }
 
 /** Summarize user prompt parts for trace (no raw file bytes; filenames only). */
@@ -318,9 +255,30 @@ export function traceChatInitFromUserMessage(
   s.chat!.user_text_preview = text
 }
 
+/** Record one `message.part.delta` (after `Session.updatePartDelta`). */
+export function traceRecordMessagePartDelta(
+  s: WorkflowTraceSession | undefined,
+  input: { messageID: string; partID: string; field: string; delta: string },
+) {
+  if (!s || !input.delta) return
+  ensureChat(s)
+  const list = (s.chat!.part_deltas ??= [])
+  if (list.length >= MAX_PART_DELTA_EVENTS()) return
+  const cap = PART_DELTA_CAP()
+  let delta = input.delta
+  if (delta.length > cap) delta = `${delta.slice(0, cap - 3)}...`
+  list.push({
+    ms: Math.round(performance.now() - s.t0Ms),
+    message_id: input.messageID,
+    part_id: input.partID,
+    field: input.field,
+    delta,
+  })
+}
+
 /**
- * Record one AI SDK fullStream event into `chat.stream_packages` (one trace row per delta; no merging).
- * `chat.llm_stream` is filled at persist from packages.
+ * Lightweight fullStream hook: TTFT / `model_stream_text` only.
+ * Per-chunk UI replay lives in `chat.part_deltas` (`traceRecordMessagePartDelta`).
  */
 export function traceRecordLlmStreamEvent(s: WorkflowTraceSession | undefined, ev: LlmStreamEvent) {
   if (!s) return
@@ -328,73 +286,16 @@ export function traceRecordLlmStreamEvent(s: WorkflowTraceSession | undefined, e
     case "start":
       s._modelStreamChunks = undefined
       s._modelStreamTotal = undefined
-      ensureChat(s)
-      s.chat!.stream_packages = []
-      s.chat!.llm_stream = undefined
-      pushLlmTrace(s, "start")
-      return
-    case "start-step":
-      pushLlmTrace(s, "start_step")
-      return
-    case "finish-step":
-      pushLlmTrace(s, "finish_step", undefined, String(ev.finishReason ?? ""))
-      return
-    case "finish":
-      pushLlmTrace(s, "finish")
-      return
-    case "text-start":
-      pushLlmTrace(s, "text_start")
       return
     case "text-delta":
       recordTtftOnDelta(s, ev.text, "text")
       appendModelStreamText(s, ev.text)
-      if (ev.text) pushLlmTrace(s, "text_delta", ev.text)
-      return
-    case "text-end":
-      pushLlmTrace(s, "text_end")
-      return
-    case "reasoning-start":
-      pushLlmTrace(s, "reasoning_start")
       return
     case "reasoning-delta":
       recordTtftOnDelta(s, ev.text, "reasoning")
-      if (ev.text) pushLlmTrace(s, "reasoning_delta", ev.text)
-      return
-    case "reasoning-end":
-      pushLlmTrace(s, "reasoning_end")
-      return
-    case "tool-input-start":
-      pushLlmTrace(s, "tool_input_start", undefined, ev.toolName)
-      return
-    case "tool-input-delta": {
-      const delta =
-        "delta" in ev && typeof (ev as { delta?: unknown }).delta === "string"
-          ? (ev as { delta: string }).delta
-          : ""
-      if (delta) pushLlmTrace(s, "tool_input_delta", delta)
-      return
-    }
-    case "tool-input-end":
-      pushLlmTrace(s, "tool_input_end")
-      return
-    case "tool-call": {
-      const meta = `${ev.toolName}:${JSON.stringify(ev.input ?? {})}`
-      pushLlmTrace(s, "tool_call", undefined, meta.length > 400 ? `${meta.slice(0, 397)}...` : meta)
-      return
-    }
-    case "tool-result":
-      pushLlmTrace(s, "tool_result", undefined, ev.toolCallId)
-      return
-    case "tool-error": {
-      const err = "error" in ev ? (ev as { error: unknown }).error : undefined
-      pushLlmTrace(s, "tool_error", undefined, err instanceof Error ? err.message : String(err ?? ""))
-      return
-    }
-    case "error":
-      pushLlmTrace(s, "error", undefined, ev.error instanceof Error ? ev.error.message : String(ev.error))
       return
     default:
-      pushLlmTrace(s, `unhandled_${(ev as { type: string }).type}`)
+      return
   }
 }
 
@@ -479,7 +380,6 @@ export function scheduleWorkflowTracePersist(
     void (async () => {
       try {
         materializeModelStreamText(session)
-        finalizeLlmStreamFromPackages(session)
         const payload: Record<string, unknown> = {
           format: TRACE_FORMAT,
           request_id: meta.requestId,

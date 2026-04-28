@@ -24,6 +24,7 @@ import {
   WorkflowTraceSessionRef,
   traceChatFinalizeAssistant,
   traceRecordLlmStreamEvent,
+  traceRecordMessagePartDelta,
 } from "@/server/workflow-trace"
 
 const DOOM_LOOP_THRESHOLD = 3
@@ -254,6 +255,12 @@ export const layer: Layer.Layer<
               field: "text",
               delta: value.text,
             })
+            traceRecordMessagePartDelta(wfTrace, {
+              messageID: ctx.reasoningMap[value.id].messageID,
+              partID: ctx.reasoningMap[value.id].id,
+              field: "text",
+              delta: value.text,
+            })
             return
 
           case "reasoning-end":
@@ -433,6 +440,12 @@ export const layer: Layer.Layer<
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.currentText.sessionID,
+              messageID: ctx.currentText.messageID,
+              partID: ctx.currentText.id,
+              field: "text",
+              delta: value.text,
+            })
+            traceRecordMessagePartDelta(wfTrace, {
               messageID: ctx.currentText.messageID,
               partID: ctx.currentText.id,
               field: "text",
